@@ -1,10 +1,10 @@
 # DB_File.pm -- Perl 5 interface to Berkeley DB 
 #
 # written by Paul Marquess (Paul.Marquess@btinternet.com)
-# last modified 22nc Oct 2001
-# version 1.79
+# last modified 1st September 2002
+# version 1.805
 #
-#     Copyright (c) 1995-2001 Paul Marquess. All rights reserved.
+#     Copyright (c) 1995-2002 Paul Marquess. All rights reserved.
 #     This program is free software; you can redistribute it and/or
 #     modify it under the same terms as Perl itself.
 
@@ -32,8 +32,13 @@ sub TIEHASH
 {
     my $pkg = shift ;
 
-    bless { VALID => { map {$_, 1} 
-		       qw( bsize ffactor nelem cachesize hash lorder)
+    bless { VALID => { 
+		       	bsize	  => 1,
+			ffactor	  => 1,
+			nelem	  => 1,
+			cachesize => 1,
+			hash	  => 2,
+			lorder	  => 1,
 		     }, 
 	    GOT   => {}
           }, $pkg ;
@@ -58,8 +63,12 @@ sub STORE
     my $key   = shift ;
     my $value = shift ;
 
-    if ( exists $self->{VALID}{$key} )
+    my $type = $self->{VALID}{$key};
+
+    if ( $type )
     {
+    	croak "Key '$key' not associated with a code reference" 
+	    if $type == 2 && !ref $value && ref $value ne 'CODE';
         $self->{GOT}{$key} = $value ;
         return ;
     }
@@ -132,9 +141,15 @@ sub TIEHASH
 {
     my $pkg = shift ;
 
-    bless { VALID => { map {$_, 1} 
-		       qw( flags cachesize maxkeypage minkeypage psize 
-			   compare prefix lorder )
+    bless { VALID => { 
+		      	flags	   => 1,
+			cachesize  => 1,
+			maxkeypage => 1,
+			minkeypage => 1,
+			psize	   => 1,
+			compare	   => 2,
+			prefix	   => 2,
+			lorder	   => 1,
 	    	     },
 	    GOT   => {},
           }, $pkg ;
@@ -145,13 +160,19 @@ package DB_File ;
 
 use warnings;
 use strict;
-use vars qw($VERSION @ISA @EXPORT $AUTOLOAD $DB_BTREE $DB_HASH $DB_RECNO 
-            $db_version $use_XSLoader
-           ) ;
+our ($VERSION, @ISA, @EXPORT, $AUTOLOAD, $DB_BTREE, $DB_HASH, $DB_RECNO);
+our ($db_version, $use_XSLoader, $splice_end_array);
 use Carp;
 
 
-$VERSION = "1.79" ;
+$VERSION = "1.805" ;
+
+{
+    local $SIG{__WARN__} = sub {$splice_end_array = "@_";};
+    my @a =(1); splice(@a, 3);
+    $splice_end_array = 
+        ($splice_end_array =~ /^splice\(\) offset past end of array at /);
+}      
 
 #typedef enum { DB_BTREE, DB_HASH, DB_RECNO } DBTYPE;
 $DB_BTREE = new DB_File::BTREEINFO ;
@@ -210,22 +231,12 @@ push @ISA, qw(Tie::Hash Exporter);
 sub AUTOLOAD {
     my($constname);
     ($constname = $AUTOLOAD) =~ s/.*:://;
-    my $val = constant($constname, @_ ? $_[0] : 0);
-    if ($! != 0) {
-	if ($! =~ /Invalid/ || $!{EINVAL}) {
-	    $AutoLoader::AUTOLOAD = $AUTOLOAD;
-	    goto &AutoLoader::AUTOLOAD;
-	}
-	else {
-	    my($pack,$file,$line) = caller;
-	    croak "Your vendor has not defined DB macro $constname, used at $file line $line.
-";
-	}
-    }
+    my ($error, $val) = constant($constname);
+    Carp::croak $error if $error;
     no strict 'refs';
     *{$AUTOLOAD} = sub { $val };
     goto &{$AUTOLOAD};
-}
+}           
 
 
 eval {
@@ -251,6 +262,9 @@ sub tie_hash_or_array
 
     $arg[4] = tied %{ $arg[4] } 
 	if @arg >= 5 && ref $arg[4] && $arg[4] =~ /=HASH/ && tied %{ $arg[4] } ;
+
+    $arg[2] = O_CREAT()|O_RDWR() if @arg >=3 && ! defined $arg[2];
+    $arg[3] = 0666               if @arg >=4 && ! defined $arg[3];
 
     # make recno in Berkeley DB version 2 work like recno in version 1.
     if ($db_version > 1 and defined $arg[4] and $arg[4] =~ /RECNO/ and 
@@ -314,7 +328,7 @@ sub SPLICE
     my $self = shift;
     my $offset = shift;
     if (not defined $offset) {
-	carp 'Use of uninitialized value in splice';
+	warnings::warnif('uninitialized', 'Use of uninitialized value in splice');
 	$offset = 0;
     }
 
@@ -339,13 +353,15 @@ sub SPLICE
 	$offset = $new_offset;
     }
 
-    if ($offset > $size) {
- 	$offset = $size;
+    if (not defined $length) {
+	warnings::warnif('uninitialized', 'Use of uninitialized value in splice');
+	$length = 0;
     }
 
-    if (not defined $length) {
-	carp 'Use of uninitialized value in splice';
-	$length = 0;
+    if ($offset > $size) {
+ 	$offset = $size;
+	warnings::warnif('misc', 'splice() offset past end of array')
+            if $splice_end_array;
     }
 
     # 'If LENGTH is omitted, removes everything from OFFSET onward.'
@@ -595,7 +611,7 @@ DB_File - Perl5 access to Berkeley DB version 1.x
 
 B<DB_File> is a module which allows Perl programs to make use of the
 facilities provided by Berkeley DB version 1.x (if you have a newer
-version of DB, see L<Using DB_File with Berkeley DB version 2 or greater).
+version of DB, see L<Using DB_File with Berkeley DB version 2 or greater>).
 It is assumed that you have a copy of the Berkeley DB manual pages at
 hand when reading this documentation. The interface defined here
 mirrors the Berkeley DB interface closely.
@@ -839,7 +855,7 @@ contents of the database.
     use warnings ;
     use strict ;
     use DB_File ;
-    use vars qw( %h $k $v ) ;
+    our (%h, $k, $v) ;
 
     unlink "fruit" ;
     tie %h, "DB_File", "fruit", O_RDWR|O_CREAT, 0666, $DB_HASH 
@@ -989,7 +1005,7 @@ code:
     use strict ;
     use DB_File ;
 
-    use vars qw($filename %h ) ;
+    my ($filename, %h) ;
 
     $filename = "tree" ;
     unlink $filename ;
@@ -1044,7 +1060,7 @@ Here is the script above rewritten using the C<seq> API method.
     use strict ;
     use DB_File ;
 
-    use vars qw($filename $x %h $status $key $value) ;
+    my ($filename, $x, %h, $status, $key, $value) ;
 
     $filename = "tree" ;
     unlink $filename ;
@@ -1116,7 +1132,7 @@ this:
     use strict ;
     use DB_File ;
 
-    use vars qw($filename $x %h ) ;
+    my ($filename, $x, %h) ;
 
     $filename = "tree" ;
 
@@ -1166,9 +1182,9 @@ Assuming the database from the previous example:
     use strict ;
     use DB_File ;
 
-    use vars qw($filename $x %h $found) ;
+    my ($filename, $x, %h, $found) ;
 
-    my $filename = "tree" ;
+    $filename = "tree" ;
 
     # Enable duplicate records
     $DB_BTREE->{'flags'} = R_DUP ;
@@ -1205,9 +1221,9 @@ Again assuming the existence of the C<tree> database
     use strict ;
     use DB_File ;
 
-    use vars qw($filename $x %h $found) ;
+    my ($filename, $x, %h, $found) ;
 
-    my $filename = "tree" ;
+    $filename = "tree" ;
 
     # Enable duplicate records
     $DB_BTREE->{'flags'} = R_DUP ;
@@ -1251,7 +1267,7 @@ and print the first matching key/value pair given a partial key.
     use DB_File ;
     use Fcntl ;
 
-    use vars qw($filename $x %h $st $key $value) ;
+    my ($filename, $x, %h, $st, $key, $value) ;
 
     sub match
     {
@@ -1450,7 +1466,7 @@ L<THE API INTERFACE>).
 
     use warnings ;
     use strict ;
-    use vars qw(@h $H $file $i) ;
+    my (@h, $H, $file, $i) ;
     use DB_File ;
     use Fcntl ;
 
@@ -2015,7 +2031,7 @@ F<authors/id/TOMC/scripts/nshist.gz>).
     use DB_File ;
     use Fcntl ;
 
-    use vars qw( $dotdir $HISTORY %hist_db $href $binary_time $date ) ;
+    my ($dotdir, $HISTORY, %hist_db, $href, $binary_time, $date) ;
     $dotdir = $ENV{HOME} || $ENV{LOGNAME};
 
     $HISTORY = "$dotdir/.netscape/history.db";
@@ -2170,7 +2186,7 @@ Consider this script:
     use warnings ;
     use strict ;
     use DB_File ;
-    use vars qw(%x) ;
+    my %x ;
     tie %x, DB_File, "filename" ;
 
 Running it produces the error in question:
@@ -2236,7 +2252,7 @@ compile properly on IRIX 5.3.
 
 =head1 COPYRIGHT
 
-Copyright (c) 1995-2001 Paul Marquess. All rights reserved. This program
+Copyright (c) 1995-2002 Paul Marquess. All rights reserved. This program
 is free software; you can redistribute it and/or modify it under the
 same terms as Perl itself.
 

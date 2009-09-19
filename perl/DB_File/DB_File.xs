@@ -3,12 +3,12 @@
  DB_File.xs -- Perl 5 interface to Berkeley DB 
 
  written by Paul Marquess <Paul.Marquess@btinternet.com>
- last modified 22nd Oct 2001
- version 1.79
+ last modified 1st September 2002
+ version 1.805
 
  All comments/suggestions/problems are welcome
 
-     Copyright (c) 1995-2001 Paul Marquess. All rights reserved.
+     Copyright (c) 1995-2002 Paul Marquess. All rights reserved.
      This program is free software; you can redistribute it and/or
      modify it under the same terms as Perl itself.
 
@@ -95,6 +95,16 @@
         1.78 -  Core patch 10335, 10372, 10534, 10549, 11051 included.
         1.79 -  NEXTKEY ignores the input key.
                 Added lots of casts
+        1.800 - Moved backward compatability code into ppport.h.
+                Use the new constants code.
+        1.801 - No change to DB_File.xs
+        1.802 - No change to DB_File.xs
+        1.803 - FETCH, STORE & DELETE don't map the flags parameter
+                into the equivalent Berkeley DB function anymore.
+        1.804 - no change.
+        1.805 - recursion detection added to the callbacks
+                Support for 4.1.X added.
+                Filter code can now cope with read-only $_
 
 */
 
@@ -103,23 +113,8 @@
 #include "perl.h"
 #include "XSUB.h"
 
-#ifndef PERL_VERSION
-#    include "patchlevel.h"
-#    define PERL_REVISION	5
-#    define PERL_VERSION	PATCHLEVEL
-#    define PERL_SUBVERSION	SUBVERSION
-#endif
-
-#if PERL_REVISION == 5 && (PERL_VERSION < 4 || (PERL_VERSION == 4 && PERL_SUBVERSION <= 75 ))
-
-#    define PL_sv_undef		sv_undef
-#    define PL_na		na
-
-#endif
-
-/* DEFSV appears first in 5.004_56 */
-#ifndef DEFSV
-#    define DEFSV		GvSV(defgv)
+#ifdef _NOT_CORE
+#  include "ppport.h"
 #endif
 
 /* Mention DB_VERSION_MAJOR_CFG, DB_VERSION_MINOR_CFG, and
@@ -132,15 +127,6 @@
 /* #if DB_VERSION_MAJOR_CFG < 2  */
 #ifndef DB_VERSION_MAJOR
 #    undef __attribute__
-#endif
-
-
-
-/* If Perl has been compiled with Threads support,the symbol op will
-   be defined here. This clashes with a field name in db.h, so get rid of it.
- */
-#ifdef op
-#    undef op
 #endif
 
 #ifdef COMPAT185
@@ -177,21 +163,9 @@
 
 #endif /* Perl >= 5.7 */
 
-#ifndef pTHX
-#    define pTHX
-#    define pTHX_
-#    define aTHX
-#    define aTHX_
-#endif
-
-#ifndef newSVpvn
-#    define newSVpvn(a,b)	newSVpv(a,b)
-#endif
-
 #include <fcntl.h> 
 
 /* #define TRACE */
-#define DBM_FILTERING
 
 #ifdef TRACE
 #    define Trace(x)        printf x
@@ -210,6 +184,10 @@
 
 #if DB_VERSION_MAJOR > 3 || (DB_VERSION_MAJOR == 3 && DB_VERSION_MINOR >= 2)
 #    define AT_LEAST_DB_3_2
+#endif
+
+#if DB_VERSION_MAJOR > 4 || (DB_VERSION_MAJOR == 4 && DB_VERSION_MINOR >= 1)
+#    define AT_LEAST_DB_4_1
 #endif
 
 /* map version 2 features & constants onto their version 1 equivalent */
@@ -356,16 +334,16 @@ typedef union INFO {
 
 
 
-#define db_DELETE(db, key, flags)       ((db->dbp)->del)(db->dbp, TXN &key, flags)
-#define db_STORE(db, key, value, flags) ((db->dbp)->put)(db->dbp, TXN &key, &value, flags)
-#define db_FETCH(db, key, flags)        ((db->dbp)->get)(db->dbp, TXN &key, &value, flags)
+#define db_DELETE(db, key, flags)       ((db->dbp)->del)(db->dbp, TXN &key, 0)
+#define db_STORE(db, key, value, flags) ((db->dbp)->put)(db->dbp, TXN &key, &value, 0)
+#define db_FETCH(db, key, flags)        ((db->dbp)->get)(db->dbp, TXN &key, &value, 0)
 
 #define db_sync(db, flags)              ((db->dbp)->sync)(db->dbp, flags)
 #define db_get(db, key, value, flags)   ((db->dbp)->get)(db->dbp, TXN &key, &value, flags)
 
 #ifdef DB_VERSION_MAJOR
-#define db_DESTROY(db)                  ( db->cursor->c_close(db->cursor),\
-					  (db->dbp->close)(db->dbp, 0) )
+#define db_DESTROY(db)                  (!db->aborted && ( db->cursor->c_close(db->cursor),\
+					  (db->dbp->close)(db->dbp, 0) ))
 #define db_close(db)			((db->dbp)->close)(db->dbp, 0)
 #define db_del(db, key, flags)          (flagSet(flags, R_CURSOR) 					\
 						? ((db->cursor)->c_del)(db->cursor, 0)		\
@@ -373,7 +351,7 @@ typedef union INFO {
 
 #else /* ! DB_VERSION_MAJOR */
 
-#define db_DESTROY(db)                  ((db->dbp)->close)(db->dbp)
+#define db_DESTROY(db)                  (!db->aborted && ((db->dbp)->close)(db->dbp))
 #define db_close(db)			((db->dbp)->close)(db->dbp)
 #define db_del(db, key, flags)          ((db->dbp)->del)(db->dbp, &key, flags)
 #define db_put(db, key, value, flags)   ((db->dbp)->put)(db->dbp, &key, &value, flags)
@@ -387,8 +365,12 @@ typedef struct {
 	DBTYPE	type ;
 	DB * 	dbp ;
 	SV *	compare ;
+	bool	in_compare ;
 	SV *	prefix ;
+	bool	in_prefix ;
 	SV *	hash ;
+	bool	in_hash ;
+	bool	aborted ;
 	int	in_memory ;
 #ifdef BERKELEY_DB_1_OR_2
 	INFO 	info ;
@@ -396,51 +378,25 @@ typedef struct {
 #ifdef DB_VERSION_MAJOR
 	DBC *	cursor ;
 #endif
-#ifdef DBM_FILTERING
 	SV *    filter_fetch_key ;
 	SV *    filter_store_key ;
 	SV *    filter_fetch_value ;
 	SV *    filter_store_value ;
 	int     filtering ;
-#endif /* DBM_FILTERING */
 
 	} DB_File_type;
 
 typedef DB_File_type * DB_File ;
 typedef DBT DBTKEY ;
 
-#ifdef DBM_FILTERING
-
-#define ckFilter(arg,type,name)					\
-	if (db->type) {						\
-	    SV * save_defsv ;					\
-            /* printf("filtering %s\n", name) ; */ 		\
-	    if (db->filtering)					\
-	        croak("recursion detected in %s", name) ;	\
-	    db->filtering = TRUE ;				\
-	    save_defsv = newSVsv(DEFSV) ;			\
-	    sv_setsv(DEFSV, arg) ;				\
-	    PUSHMARK(sp) ;					\
-	    (void) perl_call_sv(db->type, G_DISCARD|G_NOARGS); 	\
-	    sv_setsv(arg, DEFSV) ;				\
-	    sv_setsv(DEFSV, save_defsv) ;			\
-	    SvREFCNT_dec(save_defsv) ;				\
-	    db->filtering = FALSE ;				\
-	    /* printf("end of filtering %s\n", name) ; */ 	\
-	}
-
-#else
-
-#define ckFilter(arg,type, name)
-
-#endif /* DBM_FILTERING */
-
 #define my_sv_setpvn(sv, d, s) sv_setpvn(sv, (s ? d : (void*)""), s)
 
 #define OutputValue(arg, name)  					\
 	{ if (RETVAL == 0) {						\
 	      my_sv_setpvn(arg, name.data, name.size) ;			\
-	      ckFilter(arg, filter_fetch_value,"filter_fetch_value") ; 	\
+	      TAINT;                                       	\
+	      SvTAINTED_on(arg);                                       	\
+	      DBM_ckFilter(arg, filter_fetch_value,"filter_fetch_value") ; 	\
 	  }								\
 	}
 
@@ -452,7 +408,9 @@ typedef DBT DBTKEY ;
 		}							\
 		else 							\
 		    sv_setiv(arg, (I32)*(I32*)name.data - 1); 		\
-	      ckFilter(arg, filter_fetch_key,"filter_fetch_key") ; 	\
+	      TAINT;                                       	\
+	      SvTAINTED_on(arg);                                       	\
+	      DBM_ckFilter(arg, filter_fetch_key,"filter_fetch_key") ; 	\
 	  } 								\
 	}
 
@@ -463,10 +421,24 @@ extern void __getBerkeleyDBInfo(void);
 #endif
 
 /* Internal Global Data */
-static recno_t Value ; 
-static recno_t zero = 0 ;
-static DB_File CurrentDB ;
-static DBTKEY empty ;
+
+#define MY_CXT_KEY "DB_File::_guts" XS_VERSION
+
+typedef struct {
+    recno_t	x_Value; 
+    recno_t	x_zero;
+    DB_File	x_CurrentDB;
+    DBTKEY	x_empty;
+} my_cxt_t;
+
+START_MY_CXT
+
+#define Value		(MY_CXT.x_Value)
+#define zero		(MY_CXT.x_zero)
+#define CurrentDB	(MY_CXT.x_CurrentDB)
+#define empty		(MY_CXT.x_empty)
+
+#define ERR_BUFF "DB_File::Error"
 
 #ifdef DB_VERSION_MAJOR
 
@@ -530,6 +502,13 @@ u_int		flags ;
 
 #endif /* DB_VERSION_MAJOR */
 
+static void
+tidyUp(DB_File db)
+{
+    /* db_DESTROY(db); */
+    db->aborted = TRUE ;
+}
+
 
 static int
 #ifdef AT_LEAST_DB_3_2
@@ -560,10 +539,18 @@ const DBT * key2 ;
     dTHX;
 #endif    
     dSP ;
-    char * data1, * data2 ;
+    dMY_CXT ;
+    void * data1, * data2 ;
     int retval ;
     int count ;
+    DB_File	keep_CurrentDB = CurrentDB;
     
+
+    if (CurrentDB->in_compare) {
+        tidyUp(CurrentDB);
+        croak ("DB_File btree_compare: recursion detected\n") ;
+    }
+
     data1 = (char *) key1->data ;
     data2 = (char *) key2->data ;
 
@@ -587,18 +574,26 @@ const DBT * key2 ;
     PUSHs(sv_2mortal(newSVpvn(data2,key2->size)));
     PUTBACK ;
 
+    CurrentDB->in_compare = TRUE;
+
     count = perl_call_sv(CurrentDB->compare, G_SCALAR); 
+
+    CurrentDB = keep_CurrentDB;
+    CurrentDB->in_compare = FALSE;
 
     SPAGAIN ;
 
-    if (count != 1)
+    if (count != 1){
+        tidyUp(CurrentDB);
         croak ("DB_File btree_compare: expected 1 return value from compare sub, got %d\n", count) ;
+    }
 
     retval = POPi ;
 
     PUTBACK ;
     FREETMPS ;
     LEAVE ;
+
     return (retval) ;
 
 }
@@ -631,10 +626,17 @@ const DBT * key2 ;
     dTHX;
 #endif    
     dSP ;
+    dMY_CXT ;
     char * data1, * data2 ;
     int retval ;
     int count ;
+    DB_File	keep_CurrentDB = CurrentDB;
     
+    if (CurrentDB->in_prefix){
+        tidyUp(CurrentDB);
+        croak ("DB_File btree_prefix: recursion detected\n") ;
+    }
+
     data1 = (char *) key1->data ;
     data2 = (char *) key2->data ;
 
@@ -658,12 +660,19 @@ const DBT * key2 ;
     PUSHs(sv_2mortal(newSVpvn(data2,key2->size)));
     PUTBACK ;
 
+    CurrentDB->in_prefix = TRUE;
+
     count = perl_call_sv(CurrentDB->prefix, G_SCALAR); 
+
+    CurrentDB = keep_CurrentDB;
+    CurrentDB->in_prefix = FALSE;
 
     SPAGAIN ;
 
-    if (count != 1)
+    if (count != 1){
+        tidyUp(CurrentDB);
         croak ("DB_File btree_prefix: expected 1 return value from prefix sub, got %d\n", count) ;
+    }
  
     retval = POPi ;
  
@@ -709,8 +718,15 @@ HASH_CB_SIZE_TYPE size ;
     dTHX;
 #endif    
     dSP ;
+    dMY_CXT;
     int retval ;
     int count ;
+    DB_File	keep_CurrentDB = CurrentDB;
+
+    if (CurrentDB->in_hash){
+        tidyUp(CurrentDB);
+        croak ("DB_File hash callback: recursion detected\n") ;
+    }
 
 #ifndef newSVpvn
     if (size == 0)
@@ -726,12 +742,19 @@ HASH_CB_SIZE_TYPE size ;
     XPUSHs(sv_2mortal(newSVpvn((char*)data,size)));
     PUTBACK ;
 
+    keep_CurrentDB->in_hash = TRUE;
+
     count = perl_call_sv(CurrentDB->hash, G_SCALAR); 
+
+    CurrentDB = keep_CurrentDB;
+    CurrentDB->in_hash = FALSE;
 
     SPAGAIN ;
 
-    if (count != 1)
+    if (count != 1){
+        tidyUp(CurrentDB);
         croak ("DB_File hash_cb: expected 1 return value from hash sub, got %d\n", count) ;
+    }
 
     retval = POPi ;
 
@@ -742,6 +765,23 @@ HASH_CB_SIZE_TYPE size ;
     return (retval) ;
 }
 
+static void
+#ifdef CAN_PROTOTYPE
+db_errcall_cb(const char * db_errpfx, char * buffer)
+#else
+db_errcall_cb(db_errpfx, buffer)
+const char * db_errpfx;
+char * buffer;
+#endif
+{
+    SV * sv = perl_get_sv(ERR_BUFF, FALSE) ;
+    if (sv) {
+        if (db_errpfx)
+            sv_setpvf(sv, "%s: %s", db_errpfx, buffer) ;
+        else
+            sv_setpv(sv, buffer) ;
+    }
+} 
 
 #if defined(TRACE) && defined(BERKELEY_DB_1_OR_2)
 
@@ -851,8 +891,10 @@ I32      value ;
 	I32 length = GetArrayLength(aTHX_ db) ;
 
 	/* check for attempt to write before start of array */
-	if (length + value + 1 <= 0)
+	if (length + value + 1 <= 0) {
+            tidyUp(db);
 	    croak("Modification of non-creatable array value attempted, subscript %ld", (long)value) ;
+	}
 
 	value = length + value + 1 ;
     }
@@ -884,16 +926,15 @@ SV *   sv ;
     void *	openinfo = NULL ;
     INFO	* info  = &RETVAL->info ;
     STRLEN	n_a;
+    dMY_CXT;
 
 /* printf("In ParseOpenInfo name=[%s] flags=[%d] mode = [%d]\n", name, flags, mode) ;  */
     Zero(RETVAL, 1, DB_File_type) ;
 
     /* Default to HASH */
-#ifdef DBM_FILTERING
     RETVAL->filtering = 0 ;
     RETVAL->filter_fetch_key = RETVAL->filter_store_key = 
     RETVAL->filter_fetch_value = RETVAL->filter_store_value =
-#endif /* DBM_FILTERING */
     RETVAL->hash = RETVAL->compare = RETVAL->prefix = NULL ;
     RETVAL->type = DB_HASH ;
 
@@ -1157,16 +1198,15 @@ SV *   sv ;
     DB *	dbp ;
     STRLEN	n_a;
     int		status ;
+    dMY_CXT;
 
 /* printf("In ParseOpenInfo name=[%s] flags=[%d] mode = [%d]\n", name, flags, mode) ;  */
     Zero(RETVAL, 1, DB_File_type) ;
 
     /* Default to HASH */
-#ifdef DBM_FILTERING
     RETVAL->filtering = 0 ;
     RETVAL->filter_fetch_key = RETVAL->filter_store_key = 
     RETVAL->filter_fetch_value = RETVAL->filter_store_value =
-#endif /* DBM_FILTERING */
     RETVAL->hash = RETVAL->compare = RETVAL->prefix = NULL ;
     RETVAL->type = DB_HASH ;
 
@@ -1378,14 +1418,22 @@ SV *   sv ;
             Flags |= DB_TRUNCATE ;
 #endif
 
+#ifdef AT_LEAST_DB_4_1
+        status = (RETVAL->dbp->open)(RETVAL->dbp, NULL, name, NULL, RETVAL->type, 
+	    			Flags, mode) ; 
+#else
         status = (RETVAL->dbp->open)(RETVAL->dbp, name, NULL, RETVAL->type, 
 	    			Flags, mode) ; 
+#endif
 	/* printf("open returned %d %s\n", status, db_strerror(status)) ; */
 
-        if (status == 0)
+        if (status == 0) {
+	    RETVAL->dbp->set_errcall(RETVAL->dbp, db_errcall_cb) ;
+
             status = (RETVAL->dbp->cursor)(RETVAL->dbp, NULL, &RETVAL->cursor,
 			0) ;
-	/* printf("cursor returned %d %s\n", status, db_strerror(status)) ; */
+	    /* printf("cursor returned %d %s\n", status, db_strerror(status)) ; */
+	}
 
         if (status)
 	    RETVAL->dbp = NULL ;
@@ -1399,246 +1447,16 @@ SV *   sv ;
 } /* ParseOpenInfo */
 
 
-static double 
-#ifdef CAN_PROTOTYPE
-constant(char *name, int arg)
-#else
-constant(name, arg)
-char *name;
-int arg;
-#endif
-{
-    errno = 0;
-    switch (*name) {
-    case 'A':
-	break;
-    case 'B':
-	if (strEQ(name, "BTREEMAGIC"))
-#ifdef BTREEMAGIC
-	    return BTREEMAGIC;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "BTREEVERSION"))
-#ifdef BTREEVERSION
-	    return BTREEVERSION;
-#else
-	    goto not_there;
-#endif
-	break;
-    case 'C':
-	break;
-    case 'D':
-	if (strEQ(name, "DB_LOCK"))
-#ifdef DB_LOCK
-	    return DB_LOCK;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "DB_SHMEM"))
-#ifdef DB_SHMEM
-	    return DB_SHMEM;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "DB_TXN"))
-#ifdef DB_TXN
-	    return (U32)DB_TXN;
-#else
-	    goto not_there;
-#endif
-	break;
-    case 'E':
-	break;
-    case 'F':
-	break;
-    case 'G':
-	break;
-    case 'H':
-	if (strEQ(name, "HASHMAGIC"))
-#ifdef HASHMAGIC
-	    return HASHMAGIC;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "HASHVERSION"))
-#ifdef HASHVERSION
-	    return HASHVERSION;
-#else
-	    goto not_there;
-#endif
-	break;
-    case 'I':
-	break;
-    case 'J':
-	break;
-    case 'K':
-	break;
-    case 'L':
-	break;
-    case 'M':
-	if (strEQ(name, "MAX_PAGE_NUMBER"))
-#ifdef MAX_PAGE_NUMBER
-	    return (U32)MAX_PAGE_NUMBER;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "MAX_PAGE_OFFSET"))
-#ifdef MAX_PAGE_OFFSET
-	    return MAX_PAGE_OFFSET;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "MAX_REC_NUMBER"))
-#ifdef MAX_REC_NUMBER
-	    return (U32)MAX_REC_NUMBER;
-#else
-	    goto not_there;
-#endif
-	break;
-    case 'N':
-	break;
-    case 'O':
-	break;
-    case 'P':
-	break;
-    case 'Q':
-	break;
-    case 'R':
-	if (strEQ(name, "RET_ERROR"))
-#ifdef RET_ERROR
-	    return RET_ERROR;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "RET_SPECIAL"))
-#ifdef RET_SPECIAL
-	    return RET_SPECIAL;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "RET_SUCCESS"))
-#ifdef RET_SUCCESS
-	    return RET_SUCCESS;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_CURSOR"))
-#ifdef R_CURSOR
-	    return R_CURSOR;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_DUP"))
-#ifdef R_DUP
-	    return R_DUP;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_FIRST"))
-#ifdef R_FIRST
-	    return R_FIRST;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_FIXEDLEN"))
-#ifdef R_FIXEDLEN
-	    return R_FIXEDLEN;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_IAFTER"))
-#ifdef R_IAFTER
-	    return R_IAFTER;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_IBEFORE"))
-#ifdef R_IBEFORE
-	    return R_IBEFORE;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_LAST"))
-#ifdef R_LAST
-	    return R_LAST;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_NEXT"))
-#ifdef R_NEXT
-	    return R_NEXT;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_NOKEY"))
-#ifdef R_NOKEY
-	    return R_NOKEY;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_NOOVERWRITE"))
-#ifdef R_NOOVERWRITE
-	    return R_NOOVERWRITE;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_PREV"))
-#ifdef R_PREV
-	    return R_PREV;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_RECNOSYNC"))
-#ifdef R_RECNOSYNC
-	    return R_RECNOSYNC;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_SETCURSOR"))
-#ifdef R_SETCURSOR
-	    return R_SETCURSOR;
-#else
-	    goto not_there;
-#endif
-	if (strEQ(name, "R_SNAPSHOT"))
-#ifdef R_SNAPSHOT
-	    return R_SNAPSHOT;
-#else
-	    goto not_there;
-#endif
-	break;
-    case 'S':
-	break;
-    case 'T':
-	break;
-    case 'U':
-	break;
-    case 'V':
-	break;
-    case 'W':
-	break;
-    case 'X':
-	break;
-    case 'Y':
-	break;
-    case 'Z':
-	break;
-    case '_':
-	break;
-    }
-    errno = EINVAL;
-    return 0;
-
-not_there:
-    errno = ENOENT;
-    return 0;
-}
+#include "constants.h"   
 
 MODULE = DB_File	PACKAGE = DB_File	PREFIX = db_
 
+INCLUDE: constants.xs
+
 BOOT:
   {
+    SV * sv_err = perl_get_sv(ERR_BUFF, GV_ADD|GV_ADDMULTI) ;    
+    MY_CXT_INIT;
     __getBerkeleyDBInfo() ;
  
     DBT_clear(empty) ; 
@@ -1646,10 +1464,6 @@ BOOT:
     empty.size =  sizeof(recno_t) ;
   }
 
-double
-constant(name,arg)
-	char *		name
-	int		arg
 
 
 DB_File
@@ -1680,16 +1494,19 @@ db_DoTie_(isHASH, dbtype, name=undef, flags=O_CREAT|O_RDWR, mode=0666, type=DB_H
 int
 db_DESTROY(db)
 	DB_File		db
+	PREINIT:
+	  dMY_CXT;
 	INIT:
 	  CurrentDB = db ;
+	  Trace(("DESTROY %p\n", db));
 	CLEANUP:
+	  Trace(("DESTROY %p done\n", db));
 	  if (db->hash)
 	    SvREFCNT_dec(db->hash) ;
 	  if (db->compare)
 	    SvREFCNT_dec(db->compare) ;
 	  if (db->prefix)
 	    SvREFCNT_dec(db->prefix) ;
-#ifdef DBM_FILTERING
 	  if (db->filter_fetch_key)
 	    SvREFCNT_dec(db->filter_fetch_key) ;
 	  if (db->filter_store_key)
@@ -1698,7 +1515,6 @@ db_DESTROY(db)
 	    SvREFCNT_dec(db->filter_fetch_value) ;
 	  if (db->filter_store_value)
 	    SvREFCNT_dec(db->filter_store_value) ;
-#endif /* DBM_FILTERING */
 	  safefree(db) ;
 #ifdef DB_VERSION_MAJOR
 	  if (RETVAL > 0)
@@ -1711,6 +1527,8 @@ db_DELETE(db, key, flags=0)
 	DB_File		db
 	DBTKEY		key
 	u_int		flags
+	PREINIT:
+	  dMY_CXT;
 	INIT:
 	  CurrentDB = db ;
 
@@ -1719,6 +1537,8 @@ int
 db_EXISTS(db, key)
 	DB_File		db
 	DBTKEY		key
+	PREINIT:
+	  dMY_CXT;
 	CODE:
 	{
           DBT		value ;
@@ -1736,14 +1556,14 @@ db_FETCH(db, key, flags=0)
 	DBTKEY		key
 	u_int		flags
 	PREINIT:
-	int RETVAL;
+	  dMY_CXT ;
+	  int RETVAL ;
 	CODE:
 	{
             DBT		value ;
 
 	    DBT_clear(value) ; 
 	    CurrentDB = db ;
-	    /* RETVAL = ((db->dbp)->get)(db->dbp, TXN &key, &value, flags) ; */
 	    RETVAL = db_get(db, key, value, flags) ;
 	    ST(0) = sv_newmortal();
 	    OutputValue(ST(0), value)
@@ -1755,6 +1575,8 @@ db_STORE(db, key, value, flags=0)
 	DBTKEY		key
 	DBT		value
 	u_int		flags
+	PREINIT:
+	  dMY_CXT;
 	INIT:
 	  CurrentDB = db ;
 
@@ -1763,7 +1585,8 @@ void
 db_FIRSTKEY(db)
 	DB_File		db
 	PREINIT:
-	int RETVAL;
+	  dMY_CXT ;
+	  int RETVAL ;
 	CODE:
 	{
 	    DBTKEY	key ;
@@ -1782,7 +1605,8 @@ db_NEXTKEY(db, key)
 	DB_File		db
 	DBTKEY		key = NO_INIT
 	PREINIT:
-	int RETVAL;
+	  dMY_CXT ;
+	  int RETVAL ;
 	CODE:
 	{
 	    DBT		value ;
@@ -1803,6 +1627,8 @@ int
 unshift(db, ...)
 	DB_File		db
 	ALIAS:		UNSHIFT = 1
+	PREINIT:
+	  dMY_CXT;
 	CODE:
 	{
 	    DBTKEY	key ;
@@ -1843,9 +1669,11 @@ unshift(db, ...)
 void
 pop(db)
 	DB_File		db
+	PREINIT:
+	  dMY_CXT;
 	ALIAS:		POP = 1
 	PREINIT:
-	I32 RETVAL;
+	  I32 RETVAL;
 	CODE:
 	{
 	    DBTKEY	key ;
@@ -1872,9 +1700,11 @@ pop(db)
 void
 shift(db)
 	DB_File		db
+	PREINIT:
+	  dMY_CXT;
 	ALIAS:		SHIFT = 1
 	PREINIT:
-	I32 RETVAL;
+	  I32 RETVAL;
 	CODE:
 	{
 	    DBT		value ;
@@ -1901,6 +1731,8 @@ shift(db)
 I32
 push(db, ...)
 	DB_File		db
+	PREINIT:
+	  dMY_CXT;
 	ALIAS:		PUSH = 1
 	CODE:
 	{
@@ -1943,6 +1775,8 @@ push(db, ...)
 I32
 length(db)
 	DB_File		db
+	PREINIT:
+	  dMY_CXT;
 	ALIAS:		FETCHSIZE = 1
 	CODE:
 	    CurrentDB = db ;
@@ -1960,6 +1794,8 @@ db_del(db, key, flags=0)
 	DB_File		db
 	DBTKEY		key
 	u_int		flags
+	PREINIT:
+	  dMY_CXT;
 	CODE:
 	  CurrentDB = db ;
 	  RETVAL = db_del(db, key, flags) ;
@@ -1979,6 +1815,8 @@ db_get(db, key, value, flags=0)
 	DBTKEY		key
 	DBT		value = NO_INIT
 	u_int		flags
+	PREINIT:
+	  dMY_CXT;
 	CODE:
 	  CurrentDB = db ;
 	  DBT_clear(value) ; 
@@ -1999,6 +1837,8 @@ db_put(db, key, value, flags=0)
 	DBTKEY		key
 	DBT		value
 	u_int		flags
+	PREINIT:
+	  dMY_CXT;
 	CODE:
 	  CurrentDB = db ;
 	  RETVAL = db_put(db, key, value, flags) ;
@@ -2015,6 +1855,8 @@ db_put(db, key, value, flags=0)
 int
 db_fd(db)
 	DB_File		db
+	PREINIT:
+	  dMY_CXT ;
 	CODE:
 	  CurrentDB = db ;
 #ifdef DB_VERSION_MAJOR
@@ -2039,6 +1881,8 @@ int
 db_sync(db, flags=0)
 	DB_File		db
 	u_int		flags
+	PREINIT:
+	  dMY_CXT;
 	CODE:
 	  CurrentDB = db ;
 	  RETVAL = db_sync(db, flags) ;
@@ -2056,6 +1900,8 @@ db_seq(db, key, value, flags)
 	DBTKEY		key 
 	DBT		value = NO_INIT
 	u_int		flags
+	PREINIT:
+	  dMY_CXT;
 	CODE:
 	  CurrentDB = db ;
 	  DBT_clear(value) ; 
@@ -2071,33 +1917,13 @@ db_seq(db, key, value, flags)
 	  key
 	  value
 
-#ifdef DBM_FILTERING
-
-#define setFilter(type)					\
-	{						\
-	    if (db->type)				\
-	        RETVAL = sv_mortalcopy(db->type) ;	\
-	    ST(0) = RETVAL ;				\
-	    if (db->type && (code == &PL_sv_undef)) {	\
-                SvREFCNT_dec(db->type) ;		\
-	        db->type = NULL ;			\
-	    }						\
-	    else if (code) {				\
-	        if (db->type)				\
-	            sv_setsv(db->type, code) ;		\
-	        else					\
-	            db->type = newSVsv(code) ;		\
-	    }	    					\
-	}
-
-
 SV *
 filter_fetch_key(db, code)
 	DB_File		db
 	SV *		code
 	SV *		RETVAL = &PL_sv_undef ;
 	CODE:
-	    setFilter(filter_fetch_key) ;
+	    DBM_setFilter(db->filter_fetch_key, code) ;
 
 SV *
 filter_store_key(db, code)
@@ -2105,7 +1931,7 @@ filter_store_key(db, code)
 	SV *		code
 	SV *		RETVAL = &PL_sv_undef ;
 	CODE:
-	    setFilter(filter_store_key) ;
+	    DBM_setFilter(db->filter_store_key, code) ;
 
 SV *
 filter_fetch_value(db, code)
@@ -2113,7 +1939,7 @@ filter_fetch_value(db, code)
 	SV *		code
 	SV *		RETVAL = &PL_sv_undef ;
 	CODE:
-	    setFilter(filter_fetch_value) ;
+	    DBM_setFilter(db->filter_fetch_value, code) ;
 
 SV *
 filter_store_value(db, code)
@@ -2121,6 +1947,5 @@ filter_store_value(db, code)
 	SV *		code
 	SV *		RETVAL = &PL_sv_undef ;
 	CODE:
-	    setFilter(filter_store_value) ;
+	    DBM_setFilter(db->filter_store_value, code) ;
 
-#endif /* DBM_FILTERING */
